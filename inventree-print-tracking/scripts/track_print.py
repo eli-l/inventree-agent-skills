@@ -115,8 +115,15 @@ def main():
     api("POST", f"/api/build/{build_id}/allocate/", {"items": items})
     ok("Stock allocated")
 
-    # 6. Create incomplete output
-    step(6, "Create incomplete output (status=50 = in production)")
+    # 6. Consume
+    step(6, "Consume stock")
+    api("POST", f"/api/build/{build_id}/consume/", {
+        "lines": [{"build_line": bl["pk"], "quantity": bl["quantity"]} for bl in bls],
+    })
+    ok("Stock consumed (build_lines.consumed updated)")
+
+    # 7. Create incomplete output
+    step(7, "Create incomplete output (status=50 = in production)")
     out = api("POST", "/api/stock/", {
         "part": args.part_id,
         "build": build_id,
@@ -129,23 +136,23 @@ def main():
     out_id = out[0]["pk"] if isinstance(out, list) else out["pk"]
     ok(f"Output StockItem {out_id}")
 
-    # 7. Consume
-    step(7, "Consume stock")
-    api("POST", f"/api/build/{build_id}/consume/", {
-        "lines": [{"build_line": bl["pk"], "quantity": bl["quantity"]} for bl in bls],
-    })
-    ok("Stock consumed (build_lines.consumed updated)")
+    # 8. Mark output as in-production (required before /complete/)
+    step(8, "Mark output as in-production (is_building=true)")
+    api("PATCH", f"/api/stock/{out_id}/", {"is_building": True})
+    ok(f"StockItem {out_id} flagged is_building=true")
 
-    # 8. Complete output
-    step(8, "Complete output (status=10 = OK)")
-    api("PATCH", f"/api/stock/{out_id}/", {
-        "status": 10,
-        "notes": f"Complete — {args.date}",
+    # 9. Complete build outputs (bumps build.completed, sets StockItem to OK)
+    step(9, "Complete build outputs (bumps build.completed, sets StockItem status to OK)")
+    api("POST", f"/api/build/{build_id}/complete/", {
+        "outputs": [{"output": out_id, "quantity": args.qty}],
+        "location": args.location,
+        "status_custom_key": 10,
+        "accept_incomplete_allocation": True,
     })
-    ok(f"StockItem {out_id} marked OK")
+    ok(f"Build {build_id} outputs completed (build.completed += {args.qty})")
 
-    # 9. Finish build
-    step(9, f"Finish build {build_id}")
+    # 10. Finish build
+    step(10, f"Finish build {build_id}")
     api("POST", f"/api/build/{build_id}/finish/", {
         "accept_overallocated": "reject",
         "accept_unallocated": True,
@@ -153,8 +160,8 @@ def main():
     })
     ok("Build DONE (status=40)")
 
-    # 10. Backdate
-    step(10, f"Backdate dates to {args.date}")
+    # 11. Backdate
+    step(11, f"Backdate dates to {args.date}")
     api("PATCH", f"/api/build/{build_id}/", {
         "start_date": args.date,
         "target_date": args.date,
