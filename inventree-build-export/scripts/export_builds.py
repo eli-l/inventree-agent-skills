@@ -115,12 +115,17 @@ COLUMNS = [
     ("consumed_qty",        "Consumed Qty",        "Quantity drained from this child StockItem"),
     ("consumed_stockitem_pk","Consumed SI pk",     "The child StockItem that was consumed"),
     ("consumed_cost",       "Consumed Cost",       "This child StockItem's contribution to Production Cost"),
+    ("consumed_mfg_cost",   "Consumed Mfg Cost",   "This child Part's mfg-cost contribution (consumed_qty × per-unit mfg cost)"),
 
     # SOURCE (varies per row)
     ("source_type",         "Source Type",         "purchase_order (filament) | build (sub-assembly) | manual | data_mismatch | (blank=not consumed)"),
     ("source_ref",          "Source Ref",          "PO ref for filament, BO ref for sub-assembly"),
     ("source_stockitem_pk", "Source SI pk",        "StockItem the child was drawn from"),
     ("source_batch",        "Source Batch",        ""),
+
+    # TOTAL (per BO)
+    ("mfg_cost",            "Mfg Cost",            "Manufacturing cost rollup for the produced part (own cost entries + sub-assembly mfg costs), multiplied by produced_qty. Source: /plugin/manufacturing-costs/"),
+    ("total_cost",          "Total Cost",          "Production Cost + Mfg Cost"),
 ]
 
 
@@ -154,6 +159,62 @@ def export(inv, outfile):
     # Pre-fetch all locations
     print("Fetching all Locations ...", file=sys.stderr)
     locations = {l["pk"]: l for l in inv.get_all("/api/stock/location/")}
+
+    # Pre-fetch all BOMs (for the manufacturing-cost sub-assembly rollup)
+    print("Fetching all BOMs ...", file=sys.stderr)
+    all_boms = inv.get_all("/api/bom/")
+    bom_by_parent = {}  # parent_part_pk -> [{sub_part, quantity}, ...]
+    for b in all_boms:
+        bom_by_parent.setdefault(b.get("part"), []).append({
+            "sub_part": b.get("sub_part"),
+            "quantity": float(b.get("quantity") or 0),
+        })
+
+    # Pre-fetch ManufacturingCosts plugin data (rates + cost entries).
+    # Endpoint lives under /plugin/, not /api/, in InvenTree 1.3+.
+    print("Fetching ManufacturingCosts plugin data ...", file=sys.stderr)
+    rate_by_pk = {}                    # rate_pk -> {price, price_currency, units, name}
+    cost_entries_by_part = {}          # part_pk -> [cost_entry, ...]
+    try:
+        rates = inv.get_all("/plugin/manufacturing-costs/rate/")
+        for r in rates:
+            rate_by_pk[r["pk"]] = r
+        costs = inv.get_all("/plugin/manufacturing-costs/cost/")
+        for c in costs:
+            if not c.get("active", True):
+                continue
+            cost_entries_by_part.setdefault(c.get("part"), []).append(c)
+    except Exception as e:
+        print(f"  [warn] ManufacturingCosts plugin not reachable: {e}", file=sys.stderr)
+    print(f"  rates: {len(rate_by_pk)}  cost entries: {sum(len(v) for v in cost_entries_by_part.values())}", file=sys.stderr)
+
+    # Manufacturing cost rollup (per part, memoised). Returns the cost of
+    # producing 1 unit of `part_pk` in EUR, including sub-assembly mfg
+    # costs. Cycles are guarded.
+    _mfg_memo = {}
+    _mfg_visiting = set()
+
+    def part_mfg_cost(part_pk):
+        if part_pk in _mfg_memo:
+            return _mfg_memo[part_pk]
+        if part_pk in _mfg_visiting:
+            return 0.0
+        _mfg_visiting.add(part_pk)
+        total = 0.0
+        # 1. Direct cost entries on this part
+        for ce in cost_entries_by_part.get(part_pk, []):
+            rate = rate_by_pk.get(ce.get("rate"), {})
+            price = float(rate.get("price") or 0)
+            qty = float(ce.get("quantity") or 0)
+            total += qty * price
+        # 2. Sub-assembly mfg costs (recursive, multiplied by BOM qty)
+        for b in bom_by_parent.get(part_pk, []):
+            sub_pk = b["sub_part"]
+            sub_qty = b["quantity"]
+            total += sub_qty * part_mfg_cost(sub_pk)
+        _mfg_visiting.discard(part_pk)
+        _mfg_memo[part_pk] = total
+        return total
 
     # Partition stockitems.
     # An "output" of a BO is a StockItem that was PRODUCED by it
@@ -199,6 +260,18 @@ def export(inv, outfile):
         )
         return (total, cur)
 
+    def bo_mfg_cost(bo):
+        """Manufacturing cost for the produced output of this BO.
+        = produced_qty × mfg_cost_per_unit(produced_part).
+        All rates today are EUR; if that changes, currency aggregation
+        follows the same pattern as bo_production_cost.
+        """
+        produced_pk = bo.get("part")
+        if not produced_pk:
+            return 0.0
+        produced_qty = float(bo.get("quantity") or 1) or 1
+        return produced_qty * part_mfg_cost(produced_pk)
+
     print(f"Processing {len(builds)} BOs ...", file=sys.stderr)
     rows = []
     for b in builds:
@@ -226,15 +299,17 @@ def export(inv, outfile):
         if not bls:
             # Pending BO with no build_lines — show produced + no consumption
             prod_cost, prod_cur = bo_production_cost(bo_pk)
+            mfg_cost = bo_mfg_cost(b)
             rows.append(_row(
                 b=b, produced=produced, produced_qty=produced_qty,
                 production_cost=prod_cost, production_currency=prod_cur,
                 output_pks=output_pks, bl=None, bom_sub_part=None,
-                child=None, get_bo_ref=get_bo_ref,
+                child=None, mfg_cost=mfg_cost, get_bo_ref=get_bo_ref,
             ))
             continue
 
         prod_cost, prod_cur = bo_production_cost(bo_pk)
+        mfg_cost = bo_mfg_cost(b)
         for bl in bls:
             bom_sub_part = parts.get(bl.get("part")) or {}
             bl_children = pairings.get(bl["pk"], [])
@@ -244,17 +319,24 @@ def export(inv, outfile):
                     b=b, produced=produced, produced_qty=produced_qty,
                     production_cost=prod_cost, production_currency=prod_cur,
                     output_pks=output_pks, bl=bl, bom_sub_part=bom_sub_part,
-                    child=None, get_bo_ref=get_bo_ref,
+                    child=None, mfg_cost=mfg_cost, get_bo_ref=get_bo_ref,
                 ))
                 continue
 
             for child in bl_children:
                 c_cost, _ = cost_memo.get(child["pk"], (0.0, ""))
+                # Per-row mfg cost contribution = consumed_qty × per-unit mfg cost of consumed part
+                consumed_part_pk = child.get("part")
+                consumed_qty = float(child.get("quantity") or 0)
+                consumed_mfg = (consumed_qty * part_mfg_cost(consumed_part_pk)
+                                if consumed_part_pk else 0.0)
                 rows.append(_row(
                     b=b, produced=produced, produced_qty=produced_qty,
                     production_cost=prod_cost, production_currency=prod_cur,
                     output_pks=output_pks, bl=bl, bom_sub_part=bom_sub_part,
-                    child=child, consumed_cost=c_cost, get_bo_ref=get_bo_ref,
+                    child=child, consumed_cost=c_cost,
+                    consumed_mfg_cost=consumed_mfg, mfg_cost=mfg_cost,
+                    get_bo_ref=get_bo_ref,
                 ))
 
     rows.sort(key=_sort_key)
@@ -442,7 +524,8 @@ def _get_bo_ref(bo_pk):
 
 def _row(b, produced, produced_qty, production_cost, production_currency,
          output_pks, bl=None, bom_sub_part=None, child=None,
-         consumed_cost=None, get_bo_ref=None):
+         consumed_cost=None, consumed_mfg_cost=None, mfg_cost=None,
+         get_bo_ref=None):
     s = None
     if child:
         s = _resolve_source(child)
@@ -453,6 +536,10 @@ def _row(b, produced, produced_qty, production_cost, production_currency,
     consumed_qty = float(child.get("quantity") or 0) if child else ""
     consumed_si_pk = child.get("pk", "") if child else ""
 
+    prod_cost = float(production_cost or 0)
+    mfg = float(mfg_cost or 0)
+    total_cost = round(prod_cost + mfg, 4)
+
     return {
         "bo_reference":        b.get("reference", ""),
         "bo_status_text":      b.get("status_text", ""),
@@ -462,7 +549,7 @@ def _row(b, produced, produced_qty, production_cost, production_currency,
         "produced_part_ipn":   part_ref(produced),
         "produced_part_name":  part_name(produced),
         "produced_qty":        produced_qty,
-        "production_cost":     round(float(production_cost or 0), 4),
+        "production_cost":     round(prod_cost, 4),
         "production_currency": production_currency or "",
         "output_stockitem_pks":";".join(output_pks),
 
@@ -475,11 +562,15 @@ def _row(b, produced, produced_qty, production_cost, production_currency,
         "consumed_qty":        consumed_qty,
         "consumed_stockitem_pk": consumed_si_pk,
         "consumed_cost":       round(float(consumed_cost or 0), 4) if consumed_cost is not None else "",
+        "consumed_mfg_cost":   round(float(consumed_mfg_cost or 0), 4) if consumed_mfg_cost is not None else "",
 
         "source_type":         s.get("source_type", ""),
         "source_ref":          s.get("source_ref", ""),
         "source_stockitem_pk": s.get("source_stockitem_pk", ""),
         "source_batch":        s.get("source_batch", ""),
+
+        "mfg_cost":            round(mfg, 4),
+        "total_cost":          total_cost,
     }
 
 
@@ -542,8 +633,10 @@ def _write_xlsx(outfile, rows):
         "bom_sub_part_ipn": 26, "bom_sub_part_name": 30, "bom_qty_per_unit": 11,
         "consumed_part_ipn": 28, "consumed_part_name": 32,
         "consumed_qty": 11, "consumed_stockitem_pk": 11, "consumed_cost": 12,
+        "consumed_mfg_cost": 14,
         "source_type": 17, "source_ref": 11,
         "source_stockitem_pk": 11, "source_batch": 12,
+        "mfg_cost": 12, "total_cost": 12,
     }
     for col_idx, key in enumerate(keys, start=1):
         ws.column_dimensions[get_column_letter(col_idx)].width = widths.get(key, 14)

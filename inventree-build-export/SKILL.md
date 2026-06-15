@@ -40,7 +40,7 @@ export INV_TOKEN="<your token>"
 Path components on the outfile argument are dropped — output always
 lands in `./export/`. This is hard-coded in `_resolve_outfile()`.
 
-## Output schema (22 columns)
+## Output schema (25 columns)
 
 ### Build Order (constant per BO)
 | # | Column | Notes |
@@ -75,14 +75,21 @@ lands in `./export/`. This is hard-coded in `_resolve_outfile()`.
 | 16 | Consumed Qty | Drained from the child StockItem (**not** `build_line.consumed`) |
 | 17 | Consumed SI pk | The child StockItem |
 | 18 | Consumed Cost | This child StockItem's contribution to Production Cost |
+| 19 | Consumed Mfg Cost | This child Part's mfg-cost contribution (`consumed_qty × mfg_cost_per_unit(consumed_part)`) |
 
 ### Source (varies per row)
 | # | Column | Notes |
 |---|--------|-------|
-| 19 | Source Type | `purchase_order` (filament) \| `build` (sub-assembly) \| `manual` \| blank |
-| 20 | Source Ref | PO ref for filament, BO ref for sub-assembly |
-| 21 | Source SI pk | The StockItem the child was drawn from |
-| 22 | Source Batch | |
+| 20 | Source Type | `purchase_order` (filament) \| `build` (sub-assembly) \| `manual` \| blank |
+| 21 | Source Ref | PO ref for filament, BO ref for sub-assembly |
+| 22 | Source SI pk | The StockItem the child was drawn from |
+| 23 | Source Batch | |
+
+### Total (per BO)
+| # | Column | Notes |
+|---|--------|-------|
+| 24 | Mfg Cost | Manufacturing-cost rollup for the produced part (own cost entries + sub-assembly mfg costs) × `produced_qty`. Source: `/plugin/manufacturing-costs/`. |
+| 25 | Total Cost | `Production Cost + Mfg Cost` |
 
 **References use IPN throughout.** Where IPN is missing the cell shows
 `<name>@pk<n>` as a fallback so the row is still uniquely referenceable.
@@ -104,7 +111,12 @@ lands in `./export/`. This is hard-coded in `_resolve_outfile()`.
   issue — that bug only affects the build_line counter, not the stock
   ledger, so the export is unaffected.
 
-## Cost algorithm (recursive)
+## Cost algorithms (two, complementary)
+
+The export computes two separate cost streams and sums them for the
+final **Total Cost** column.
+
+### 1. Production Cost (filament / StockItem-based)
 
 The Production Cost column is computed once per StockItem, then summed
 per BO. The recursion is:
@@ -121,6 +133,36 @@ per BO. The recursion is:
 
 Memoised with cycle detection. Computed for every consumed StockItem
 in the catalog, so per-BO Production Cost is a flat sum afterwards.
+
+### 2. Mfg Cost (Manufacturing-costs plugin, per-Part-based)
+
+The Mfg Cost column is computed once per Part via the
+`inventree-manufacturing-costs` plugin, then multiplied by
+`produced_qty` per BO. The recursion is:
+
+- For each Part, sum `(quantity × rate.price)` across all **active**
+  cost entries on that Part.
+- Add the recursive Mfg Cost of each sub-assembly in the Part's BOM,
+  multiplied by the BOM quantity.
+- Cycle-guarded, memoised.
+
+Source endpoints:
+- `GET /plugin/manufacturing-costs/rate/`
+- `GET /plugin/manufacturing-costs/cost/`
+
+(Caveat: duplicate Part records with the same IPN but different `pk`s
+are treated as distinct Parts. If a Part in a BOM has no cost data
+and no sub-parts, its Mfg Cost contribution is 0 even if a duplicate
+Part with the same IPN has data. The export is honest about the gap.)
+
+### Per-row Consumed Mfg Cost
+
+For each row, `consumed_mfg_cost = consumed_qty × mfg_cost_per_unit(consumed_part)`.
+This shows the mfg cost contribution of the **consumed material** —
+i.e. what that part cost to produce in a previous BO. The 25 EUR
+difference between `sum(consumed_mfg_cost)` and `Mfg Cost` for a BO
+is the mfg cost of the **current** BO's own assembly work (e.g.
+"Frame Assembly" on the FRAME itself).
 
 ### Worked example (BO-0001 = MHY-FRAME)
 
