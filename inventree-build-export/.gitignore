@@ -1,0 +1,3 @@
+# Output directory — every script run drops an XLSX here.
+# Never commit these. Re-run the script to regenerate.
+/export/
