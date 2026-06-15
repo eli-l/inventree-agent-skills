@@ -100,6 +100,8 @@ COLUMNS = [
     ("produced_part_ipn",   "Produced Part IPN",   "IPN of the assembly this BO builds"),
     ("produced_part_name",  "Produced Part Name",  "Human-readable name"),
     ("produced_qty",        "Produced Qty",        "Total units produced (= sum of output StockItem quantities)"),
+    ("production_cost",     "Production Cost",     "Currency-aggregated cost of producing the BO output, computed recursively: filament = qty x purchase_price; sub-assemblies = sum of their children's costs"),
+    ("production_currency", "Currency",            "Currency for Production Cost (from source PO line, or 'mixed')"),
     ("output_stockitem_pks","Output StockItems",   "pk(s) of the StockItem(s) this BO created"),
 
     # BOM Sub-Part (constant across rows of one build_line)
@@ -112,6 +114,7 @@ COLUMNS = [
     ("consumed_part_name",  "Consumed Part Name",  "Specific — real filament / part"),
     ("consumed_qty",        "Consumed Qty",        "Quantity drained from this child StockItem"),
     ("consumed_stockitem_pk","Consumed SI pk",     "The child StockItem that was consumed"),
+    ("consumed_cost",       "Consumed Cost",       "This child StockItem's contribution to Production Cost"),
 
     # SOURCE (varies per row)
     ("source_type",         "Source Type",         "purchase_order (filament) | build (sub-assembly) | manual | data_mismatch | (blank=not consumed)"),
@@ -175,6 +178,27 @@ def export(inv, outfile):
     def get_bo_ref(bo_pk):
         return bo_refs.get(bo_pk, "")
 
+    # Compute per-StockItem costs (recursive, cached). Done once for the
+    # whole catalog so per-BO production cost is just a sum.
+    print("Computing production costs (recursive) ...", file=sys.stderr)
+    cost_memo = _compute_costs(consumed_by_build, stockitems_by_pk.get)
+
+    def bo_production_cost(bo_pk):
+        children = consumed_by_build.get(bo_pk, [])
+        if not children:
+            return (0.0, "")
+        total = 0.0
+        currencies = set()
+        for c in children:
+            c_cost, c_cur = cost_memo.get(c["pk"], (0.0, ""))
+            total += c_cost
+            if c_cur:
+                currencies.add(c_cur)
+        cur = currencies.pop() if len(currencies) == 1 else (
+            "mixed" if currencies else ""
+        )
+        return (total, cur)
+
     print(f"Processing {len(builds)} BOs ...", file=sys.stderr)
     rows = []
     for b in builds:
@@ -201,13 +225,16 @@ def export(inv, outfile):
 
         if not bls:
             # Pending BO with no build_lines — show produced + no consumption
+            prod_cost, prod_cur = bo_production_cost(bo_pk)
             rows.append(_row(
                 b=b, produced=produced, produced_qty=produced_qty,
+                production_cost=prod_cost, production_currency=prod_cur,
                 output_pks=output_pks, bl=None, bom_sub_part=None,
                 child=None, get_bo_ref=get_bo_ref,
             ))
             continue
 
+        prod_cost, prod_cur = bo_production_cost(bo_pk)
         for bl in bls:
             bom_sub_part = parts.get(bl.get("part")) or {}
             bl_children = pairings.get(bl["pk"], [])
@@ -215,16 +242,19 @@ def export(inv, outfile):
             if not bl_children:
                 rows.append(_row(
                     b=b, produced=produced, produced_qty=produced_qty,
+                    production_cost=prod_cost, production_currency=prod_cur,
                     output_pks=output_pks, bl=bl, bom_sub_part=bom_sub_part,
                     child=None, get_bo_ref=get_bo_ref,
                 ))
                 continue
 
             for child in bl_children:
+                c_cost, _ = cost_memo.get(child["pk"], (0.0, ""))
                 rows.append(_row(
                     b=b, produced=produced, produced_qty=produced_qty,
+                    production_cost=prod_cost, production_currency=prod_cur,
                     output_pks=output_pks, bl=bl, bom_sub_part=bom_sub_part,
-                    child=child, get_bo_ref=get_bo_ref,
+                    child=child, consumed_cost=c_cost, get_bo_ref=get_bo_ref,
                 ))
 
     rows.sort(key=_sort_key)
@@ -263,14 +293,21 @@ def pair_bls_to_children(bls, children):
     unmatched_bls = [bl for bl in bls if not pairings[bl["pk"]]]
     unused = [c for c in children if c["pk"] not in used]
     if unmatched_bls and unused:
-        unmatched_bls.sort(key=lambda bl: -float(bl.get("quantity") or 0))
-        for bl in unmatched_bls:
-            if not unused:
-                break
-            child = max(unused, key=lambda c: float(c.get("quantity") or 0))
-            pairings[bl["pk"]].append(child)
-            used.add(child["pk"])
-            unused = [c for c in unused if c["pk"] not in used]
+        if len(unmatched_bls) == 1:
+            # Single unmatched bl (generic BOM vs specific stock):
+            # all remaining children go to it.
+            pairings[unmatched_bls[0]["pk"]] = list(unused)
+        else:
+            # Multiple unmatched bls: distribute greedily by quantity
+            # (largest bl picks the largest unused child, recursively).
+            unmatched_bls.sort(key=lambda bl: -float(bl.get("quantity") or 0))
+            remaining = list(unused)
+            for bl in unmatched_bls:
+                if not remaining:
+                    break
+                child = max(remaining, key=lambda c: float(c.get("quantity") or 0))
+                pairings[bl["pk"]].append(child)
+                remaining = [c for c in remaining if c["pk"] != child["pk"]]
 
     return pairings
 
@@ -315,6 +352,81 @@ def _resolve_source(child):
     }
 
 
+def _compute_costs(consumed_by_build, _si_cache_ref):
+    """Compute the cost of every StockItem in the instance, recursively.
+
+    Algorithm:
+      - If a StockItem has `purchase_price > 0` and no producing BO,
+        it is filament (or other purchased stock) and its cost is
+        `quantity * purchase_price` (the StockItem already stores the
+        per-unit price in the same unit as `quantity`).
+      - If a StockItem has a producing BO (`build` set, no
+        `purchase_price`), it is a sub-assembly. Its cost is the
+        sum of costs of the StockItems consumed by that BO.
+      - Otherwise (no price, no BO, no children) cost is 0.
+
+    Returns: dict[si_pk, (cost: float, currency: str)]. Currency is
+    inherited from the filament source; 'mixed' if multiple currencies
+    are summed; '' if no cost could be computed.
+    """
+    cost_memo = {}      # si_pk -> (cost, currency)
+    visiting = set()    # cycle detection
+
+    def cost_of(si_pk):
+        if si_pk in cost_memo:
+            return cost_memo[si_pk]
+        if si_pk in visiting:
+            # Cycle — should not happen in well-formed data, but guard.
+            return (0.0, "")
+        visiting.add(si_pk)
+        si = _si_cache_ref(si_pk)
+        if not si:
+            visiting.discard(si_pk)
+            cost_memo[si_pk] = (0.0, "")
+            return cost_memo[si_pk]
+
+        producing_bo = si.get("build")
+        purchase_price = float(si.get("purchase_price") or 0)
+
+        if not producing_bo and purchase_price > 0:
+            # Filament (or other purchased stock) — direct cost.
+            qty = float(si.get("quantity") or 0)
+            cur = si.get("purchase_price_currency") or ""
+            visiting.discard(si_pk)
+            cost_memo[si_pk] = (qty * purchase_price, cur)
+            return cost_memo[si_pk]
+
+        if producing_bo:
+            # Sub-assembly — sum children's costs.
+            children = consumed_by_build.get(producing_bo, [])
+            total = 0.0
+            currencies = set()
+            for c in children:
+                c_cost, c_cur = cost_of(c["pk"])
+                total += c_cost
+                if c_cur:
+                    currencies.add(c_cur)
+            cur = currencies.pop() if len(currencies) == 1 else (
+                "mixed" if currencies else ""
+            )
+            visiting.discard(si_pk)
+            cost_memo[si_pk] = (total, cur)
+            return cost_memo[si_pk]
+
+        # No price, no BO — unknown.
+        visiting.discard(si_pk)
+        cost_memo[si_pk] = (0.0, "")
+        return cost_memo[si_pk]
+
+    # Walk every consumed child (that's our entry point — we only need
+    # to compute costs for SIs that show up as consumed in some BO).
+    for children in consumed_by_build.values():
+        for c in children:
+            cost_of(c["pk"])
+
+    return cost_memo
+
+
 # Caches populated during export() and used by _resolve_source().
 _stockitems_by_pk = {}
 _bo_refs_cache = {}
@@ -328,8 +440,9 @@ def _get_bo_ref(bo_pk):
     return _bo_refs_cache.get(bo_pk, "")
 
 
-def _row(b, produced, produced_qty, output_pks,
-         bl=None, bom_sub_part=None, child=None, get_bo_ref=None):
+def _row(b, produced, produced_qty, production_cost, production_currency,
+         output_pks, bl=None, bom_sub_part=None, child=None,
+         consumed_cost=None, get_bo_ref=None):
     s = None
     if child:
         s = _resolve_source(child)
@@ -349,6 +462,8 @@ def _row(b, produced, produced_qty, output_pks,
         "produced_part_ipn":   part_ref(produced),
         "produced_part_name":  part_name(produced),
         "produced_qty":        produced_qty,
+        "production_cost":     round(float(production_cost or 0), 4),
+        "production_currency": production_currency or "",
         "output_stockitem_pks":";".join(output_pks),
 
         "bom_sub_part_ipn":    part_ref(bom_sub_part) if bom_sub_part else "",
@@ -359,6 +474,7 @@ def _row(b, produced, produced_qty, output_pks,
         "consumed_part_name":  part_name(consumed_part),
         "consumed_qty":        consumed_qty,
         "consumed_stockitem_pk": consumed_si_pk,
+        "consumed_cost":       round(float(consumed_cost or 0), 4) if consumed_cost is not None else "",
 
         "source_type":         s.get("source_type", ""),
         "source_ref":          s.get("source_ref", ""),
@@ -421,10 +537,11 @@ def _write_xlsx(outfile, rows):
         "bo_reference": 11, "bo_status_text": 11,
         "bo_start_date": 12, "bo_completion_date": 14,
         "produced_part_ipn": 28, "produced_part_name": 30,
-        "produced_qty": 11, "output_stockitem_pks": 16,
+        "produced_qty": 11, "production_cost": 12, "production_currency": 9,
+        "output_stockitem_pks": 16,
         "bom_sub_part_ipn": 26, "bom_sub_part_name": 30, "bom_qty_per_unit": 11,
         "consumed_part_ipn": 28, "consumed_part_name": 32,
-        "consumed_qty": 11, "consumed_stockitem_pk": 11,
+        "consumed_qty": 11, "consumed_stockitem_pk": 11, "consumed_cost": 12,
         "source_type": 17, "source_ref": 11,
         "source_stockitem_pk": 11, "source_batch": 12,
     }

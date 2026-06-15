@@ -40,7 +40,7 @@ export INV_TOKEN="<your token>"
 Path components on the outfile argument are dropped — output always
 lands in `./export/`. This is hard-coded in `_resolve_outfile()`.
 
-## Output schema (19 columns)
+## Output schema (22 columns)
 
 ### Build Order (constant per BO)
 | # | Column | Notes |
@@ -56,30 +56,33 @@ lands in `./export/`. This is hard-coded in `_resolve_outfile()`.
 | 5 | Produced Part IPN | IPN of the assembly this BO builds |
 | 6 | Produced Part Name | Human-readable name |
 | 7 | Produced Qty | Sum of output StockItem quantities |
-| 8 | Output StockItems | pk(s) of the StockItem(s) this BO created (semicolon-joined) |
+| 8 | Production Cost | Recursive EUR cost of producing the BO's output (filament = qty × StockItem.purchase_price; sub-assemblies = sum of children's costs). See "Cost algorithm" below. |
+| 9 | Currency | Currency for Production Cost (from the filament source; `mixed` if multiple currencies; empty if unknown) |
+| 10 | Output StockItems | pk(s) of the StockItem(s) this BO created (semicolon-joined) |
 
 ### Build-line sub-part (constant per build_line)
 | # | Column | Notes |
 |---|--------|-------|
-| 9 | BOM Sub-Part IPN | Generic — placeholder in the BOM (e.g. "PETG") |
-| 10 | BOM Sub-Part Name | |
-| 11 | BOM Qty / BO Unit | Quantity per 1 BO unit |
+| 11 | BOM Sub-Part IPN | Generic — placeholder in the BOM (e.g. "PETG") |
+| 12 | BOM Sub-Part Name | |
+| 13 | BOM Qty / BO Unit | Quantity per 1 BO unit |
 
 ### Consumed (varies per row — one row per child StockItem)
 | # | Column | Notes |
 |---|--------|-------|
-| 12 | Consumed Part IPN | IPN of the **specific** material actually used |
-| 13 | Consumed Part Name | |
-| 14 | Consumed Qty | Drained from the child StockItem (**not** `build_line.consumed`) |
-| 15 | Consumed SI pk | The child StockItem |
+| 14 | Consumed Part IPN | IPN of the **specific** material actually used |
+| 15 | Consumed Part Name | |
+| 16 | Consumed Qty | Drained from the child StockItem (**not** `build_line.consumed`) |
+| 17 | Consumed SI pk | The child StockItem |
+| 18 | Consumed Cost | This child StockItem's contribution to Production Cost |
 
 ### Source (varies per row)
 | # | Column | Notes |
 |---|--------|-------|
-| 16 | Source Type | `purchase_order` (filament) \| `build` (sub-assembly) \| `manual` \| blank |
-| 17 | Source Ref | PO ref for filament, BO ref for sub-assembly |
-| 18 | Source SI pk | The StockItem the child was drawn from |
-| 19 | Source Batch | |
+| 19 | Source Type | `purchase_order` (filament) \| `build` (sub-assembly) \| `manual` \| blank |
+| 20 | Source Ref | PO ref for filament, BO ref for sub-assembly |
+| 21 | Source SI pk | The StockItem the child was drawn from |
+| 22 | Source Batch | |
 
 **References use IPN throughout.** Where IPN is missing the cell shows
 `<name>@pk<n>` as a fallback so the row is still uniquely referenceable.
@@ -100,6 +103,43 @@ lands in `./export/`. This is hard-coded in `_resolve_outfile()`.
   historical build_lines have doubled `consumed` values from a server
   issue — that bug only affects the build_line counter, not the stock
   ledger, so the export is unaffected.
+
+## Cost algorithm (recursive)
+
+The Production Cost column is computed once per StockItem, then summed
+per BO. The recursion is:
+
+- If a StockItem has `purchase_price > 0` and no producing BO → it is
+  filament (or other purchased stock) and its cost is
+  `quantity * purchase_price`. InvenTree stores the per-unit price on
+  the StockItem itself in the same unit as `quantity` (e.g. 0.01 EUR/g
+  for PETG), so no spool-mass conversion is needed.
+- If a StockItem has a producing BO (`build` set) and no
+  `purchase_price` → it is a sub-assembly. Its cost is the sum of
+  costs of the StockItems consumed by that BO.
+- Otherwise (no price, no BO, no children) → cost is 0.
+
+Memoised with cycle detection. Computed for every consumed StockItem
+in the catalog, so per-BO Production Cost is a flat sum afterwards.
+
+### Worked example (BO-0001 = MHY-FRAME)
+
+```
+BO-0001 (FRAME)            Production Cost = 16.00 EUR
+├── MHY-FRAME-BF     3.80   <- 380g PETG Black @ 0.01 EUR/g
+├── MHY-FRAME-BR     3.80   <- 380g PETG Black @ 0.01 EUR/g
+├── MHY-FRAME-CS     0.80   <-  80g PETG Green @ 0.01 EUR/g
+├── MHY-FRAME-DT     0.60   <-  60g PETG Green @ 0.01 EUR/g
+├── MHY-FRAME-TF     4.00   <- 400g PETG Black @ 0.01 EUR/g   (380g + 20g from 2 spools)
+├── MHY-FRAME-TR     2.20   <- 220g PETG Black @ 0.01 EUR/g
+└── MHY-MESH         0.80   <-  80g PETG Green @ 0.01 EUR/g
+                           sum = 16.00 EUR
+```
+
+The Consumed Cost column shows the per-child contribution. For
+composite children, that contribution is itself a rollup: e.g. when
+BO-0009 (CASE) consumes the FRAME sub-assembly, the consumed-cost for
+that row equals 16.00 (the entire production cost of the FRAME).
 
 ## Pairing algorithm (build_line → consumed child)
 
