@@ -9,6 +9,7 @@ Each skill is a self-contained folder with a `SKILL.md` (the procedure an agent 
 | Skill | Description |
 |---|---|
 | [inventree-print-tracking](./inventree-print-tracking) | Track 3D-printed parts: create build → allocate stock → consume materials → finish. |
+| [inventree-build-export](./inventree-build-export) | Export all Build Orders to XLSX (one row per BO × build_line × consumed child): produced IPN + qty, consumed IPN + qty, source PO/BO. |
 
 ## Setup
 
