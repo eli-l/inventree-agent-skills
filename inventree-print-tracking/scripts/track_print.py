@@ -59,6 +59,23 @@ def ok(msg):
     print(f"  ✓ {msg}")
 
 
+def fatal(msg):
+    """Print a fatal error and exit."""
+    print(f"\n  ✗ FATAL: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def get_build_lines(build_id):
+    """Read build lines, return as a list (not paginated dict)."""
+    bls = api("GET", f"/api/build/line/?build={build_id}")
+    return bls if isinstance(bls, list) else bls.get("results", [])
+
+
+def unconsumed_lines(build_lines):
+    """Filter to lines where consumed < quantity (idempotency guard)."""
+    return [bl for bl in build_lines if float(bl.get("consumed", 0)) < float(bl["quantity"])]
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("part_id", type=int, help="InvenTree Part id to build")
@@ -87,9 +104,9 @@ def main():
 
     # 3. Read build lines
     step(3, "Read build_lines")
-    bls = api("GET", f"/api/build/line/?build={build_id}")
+    bls = get_build_lines(build_id)
     for bl in bls:
-        print(f"  build_line pk={bl['pk']}  part={bl['part']}  qty={bl['quantity']}  ref={bl.get('reference','')}")
+        print(f"  build_line pk={bl['pk']}  part={bl['part']}  qty={bl['quantity']}  consumed={bl.get('consumed', 0)}")
 
     # 4 + 5. Find stock + allocate
     step("4-5", "Find stock and allocate")
@@ -103,9 +120,7 @@ def main():
             None,
         )
         if not chosen:
-            sys.exit(
-                f"No stock for part {bl['part']} qty {bl['quantity']} in location {args.location}"
-            )
+            fatal(f"No stock for part {bl['part']} qty {bl['quantity']} in location {args.location}")
         items.append({
             "build_line": bl["pk"],
             "stock_item": chosen,
@@ -115,15 +130,28 @@ def main():
     api("POST", f"/api/build/{build_id}/allocate/", {"items": items})
     ok("Stock allocated")
 
-    # 6. Consume
-    step(6, "Consume stock")
-    api("POST", f"/api/build/{build_id}/consume/", {
-        "lines": [{"build_line": bl["pk"], "quantity": bl["quantity"]} for bl in bls],
-    })
-    ok("Stock consumed (build_lines.consumed updated)")
+    # 6. Re-read build_lines and filter to unconsumed (idempotency guard).
+    #    InvenTree 1.2.7's /consume/ is NOT idempotent — re-submitting creates
+    #    duplicate child stock items and doubles build_line.consumed.
+    step(6, "Re-read build_lines, filter to unconsumed (idempotency guard)")
+    bls = get_build_lines(build_id)
+    to_consume = unconsumed_lines(bls)
+    if not to_consume:
+        ok("All build_lines already consumed — skipping /consume/ (idempotency guard)")
+    else:
+        for bl in to_consume:
+            print(f"  build_line {bl['pk']}  part={bl['part']}  qty={bl['quantity']}  consumed={bl.get('consumed', 0)} (will consume)")
 
-    # 7. Create incomplete output
-    step(7, "Create incomplete output (status=50 = in production)")
+    # 7. Consume
+    if to_consume:
+        step(7, "Consume stock (only for unconsumed lines)")
+        api("POST", f"/api/build/{build_id}/consume/", {
+            "lines": [{"build_line": bl["pk"], "quantity": bl["quantity"]} for bl in to_consume],
+        })
+        ok("Stock consumed")
+
+    # 8. Create incomplete output
+    step(8, "Create incomplete output (status=50 = in production)")
     out = api("POST", "/api/stock/", {
         "part": args.part_id,
         "build": build_id,
@@ -136,13 +164,13 @@ def main():
     out_id = out[0]["pk"] if isinstance(out, list) else out["pk"]
     ok(f"Output StockItem {out_id}")
 
-    # 8. Mark output as in-production (required before /complete/)
-    step(8, "Mark output as in-production (is_building=true)")
+    # 9. Mark output as in-production
+    step(9, "Mark output as in-production (is_building=true)")
     api("PATCH", f"/api/stock/{out_id}/", {"is_building": True})
     ok(f"StockItem {out_id} flagged is_building=true")
 
-    # 9. Complete build outputs (bumps build.completed, sets StockItem to OK)
-    step(9, "Complete build outputs (bumps build.completed, sets StockItem status to OK)")
+    # 10. Complete build outputs
+    step(10, "Complete build outputs (bumps build.completed, sets StockItem status to OK)")
     api("POST", f"/api/build/{build_id}/complete/", {
         "outputs": [{"output": out_id, "quantity": args.qty}],
         "location": args.location,
@@ -151,8 +179,8 @@ def main():
     })
     ok(f"Build {build_id} outputs completed (build.completed += {args.qty})")
 
-    # 10. Finish build
-    step(10, f"Finish build {build_id}")
+    # 11. Finish build
+    step(11, f"Finish build {build_id}")
     api("POST", f"/api/build/{build_id}/finish/", {
         "accept_overallocated": "reject",
         "accept_unallocated": True,
@@ -160,8 +188,8 @@ def main():
     })
     ok("Build DONE (status=40)")
 
-    # 11. Backdate
-    step(11, f"Backdate dates to {args.date}")
+    # 12. Backdate
+    step(12, f"Backdate dates to {args.date}")
     api("PATCH", f"/api/build/{build_id}/", {
         "start_date": args.date,
         "target_date": args.date,
@@ -169,6 +197,38 @@ def main():
     })
     ok("start/target/completion_date set")
 
+    # 13. VERIFY (mandatory) — catch the doubling bug or any other silent inconsistency
+    step(13, "VERIFY (mandatory) — catch silent inconsistencies before declaring done")
+    final = api("GET", f"/api/build/{build_id}/")
+    bls_final = get_build_lines(build_id)
+    out_final = api("GET", f"/api/stock/{out_id}/")
+
+    ok_or_fail = []
+    if int(final["status"]) != 40:
+        ok_or_fail.append(f"build.status={final['status']} (expected 40)")
+    if float(final["completed"]) != float(final["quantity"]):
+        ok_or_fail.append(f"build.completed={final['completed']} (expected {final['quantity']})")
+
+    for bl in bls_final:
+        if float(bl["consumed"]) != float(bl["quantity"]):
+            ok_or_fail.append(
+                f"build_line {bl['pk']} consumed={bl['consumed']} (expected {bl['quantity']})"
+            )
+
+    if int(out_final["status"]) != 10:
+        ok_or_fail.append(f"output StockItem {out_id} status={out_final['status']} (expected 10)")
+    if out_final.get("is_building"):
+        ok_or_fail.append(f"output StockItem {out_id} is_building={out_final['is_building']} (expected false)")
+
+    if ok_or_fail:
+        print()
+        print("  ✗ VERIFICATION FAILED — DO NOT DECLARE THIS BUILD COMPLETE:")
+        for line in ok_or_fail:
+            print(f"    - {line}")
+        fatal("InvenTree state is inconsistent. Investigate before proceeding.")
+
+    print()
+    print(f"  ✓✓✓ All checks passed: build.completed={final['completed']}/{final['quantity']}, all build_lines consumed correctly, output OK")
     print(f"\n✓ Build {build_id} complete. Output: StockItem {out_id}.")
 
 

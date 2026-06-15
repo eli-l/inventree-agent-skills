@@ -16,22 +16,38 @@ description: "Track 3D-printed parts in InvenTree: build, allocate, consume, fin
 3. **Read build_lines** — `GET /api/build/line/?build={id}` (separate model from BOM)
 4. **Find matching stock** — pick StockItems where `part == build_line.part` and `quantity >= build_line.quantity`
 5. **Allocate stock** — `POST /api/build/{id}/allocate/` with `items[]`
-6. **Consume stock** — `POST /api/build/{id}/consume/` with `lines[]`
-7. **Create incomplete output** — `POST /api/stock/` with `status=50` (Attention), `build=<id>`, `location=<id>`
-8. **Mark output as in-production** — `PATCH /api/stock/{id}/` with `is_building=true`. **Required** before `/complete/` will accept the output — `is_building` is writable but NOT auto-set on creation.
-9. **Complete build outputs** — `POST /api/build/{id}/complete/` with `outputs[]: [{"output": <stock_item_pk>, "quantity": <n>}]`, `location`, `status_custom_key=10`. **Required** to bump `build.completed`. Sets output StockItem to OK and clears `is_building`.
-10. **Finish build** — `POST /api/build/{id}/finish/` (status 20 → 40)
-11. **Backdate dates** — `PATCH /api/build/{id}/` with `start_date`, `target_date`, `completion_date`
+6. **Read build_lines, filter unconsumed** — re-read `/api/build/line/?build={id}` and skip lines where `consumed >= quantity`. This guards against double-submit on retry (InvenTree 1.2.7 does NOT dedupe `/consume/` — re-running it creates duplicate child stock_items and doubles `build_line.consumed`).
+7. **Consume stock** — `POST /api/build/{id}/consume/` with `lines[]` (only for the unconsumed lines from step 6)
+8. **Create incomplete output** — `POST /api/stock/` with `status=50` (Attention), `build=<id>`, `location=<id>`
+9. **Mark output as in-production** — `PATCH /api/stock/{id}/` with `is_building=true`. **Required** before `/complete/` will accept the output.
+10. **Complete build outputs** — `POST /api/build/{id}/complete/` with `outputs[]: [{"output": <stock_item_pk>, "quantity": <n>}]`, `location`, `status_custom_key=10`. **Required** to bump `build.completed`. Sets output StockItem to OK and clears `is_building`.
+11. **Finish build** — `POST /api/build/{id}/finish/` (status 20 → 40)
+12. **Backdate dates** — `PATCH /api/build/{id}/` with `start_date`, `target_date`, `completion_date`
+13. **VERIFY (mandatory)** — re-read `/api/build/{id}/` and `/api/build/line/?build={id}`. Assert:
+    - `build.status == 40`
+    - `build.completed == build.quantity`
+    - For every build_line: `consumed == quantity` (NOT 2x, NOT 0x)
+    - The output StockItem exists, has `is_building=false`, `status=10`
+    
+    If any check fails, **STOP and report the discrepancy to the user** — do not declare the build complete.
 
-## Why steps 8-9 are both mandatory
+## Why steps 6 and 13 are mandatory
+
+InvenTree 1.2.7's `/consume/` endpoint is **NOT idempotent**. Re-submitting the same payload (e.g. after a crashed exec is retried) creates a duplicate child StockItem per resubmission and doubles `build_line.consumed`. Confirmed on 2026-06-15 against ops.mistit.com: builds 24 and 25 ended up with `consumed = 2 × quantity` because the previous exec had crashed after POSTing `/consume/` but before reading the response, then a retry exec re-POSTed the same payload. The server processed both. The build_lines were overstated by 552g of Gray and 40g of Orange even though the actual stock movement was 1x.
+
+Step 6 (filter unconsumed) prevents the double-submit at submission time. Step 13 (verify) catches it after the fact in case step 6 was bypassed or some other mechanism caused the doubling.
+
+The doubling cannot be fixed via API for a finished build — only the build's `completed` and dates are writable; `build_line.consumed` is writable via `/api/build/line/{id}/` PATCH but requires manual intervention.
+
+## Why step 9 is mandatory
 
 The build's `completed` count is **not** updated by `/finish/`. It's a separate field that only `/complete/` touches. But `/complete/` will reject the call with `"This build output has already been completed"` if the output StockItem is not in the right state. The actual contract is:
 
-1. StockItem must have `is_building=true` (set via PATCH in step 8, NOT auto-set on creation)
-2. StockItem must be linked to the build (via `build=<id>` at creation in step 7)
+1. StockItem must have `is_building=true` (set via PATCH in step 9, NOT auto-set on creation)
+2. StockItem must be linked to the build (via `build=<id>` at creation in step 8)
 3. Build must be in status 20 or 30
 
-If any of these are wrong, `/complete/` either errors out or silently no-ops. Skipping these steps leaves the build in `status=40` (Complete) but `completed=0` — a silent data inconsistency that can only be fixed by editing the record directly (there's no retroactive API for finished builds — `/complete/` is rejected on a build in status 40).
+If any of these are wrong, `/complete/` either errors out or silently no-ops. Skipping these steps leaves the build in `status=40` (Complete) but `completed=0` — a silent data inconsistency.
 
 The `/complete/` endpoint also sets the output StockItem to `status_custom_key` (default 10=OK) and clears `is_building`, so it replaces the old "PATCH StockItem to status=10" step.
 
@@ -50,7 +66,7 @@ If the Part or its BOM doesn't exist, create them first.
 Set these in your environment (shell rc, `.env`, secrets manager, etc.):
 
 ```bash
-export INV_TOKEN="<your-inventree-api-token>"   # InvenTree REST API token
+export INV_TOKEN="***"   # InvenTree REST API token
 export INV_URL="https://inventree.example.com"   # base URL of your InvenTree instance
 export INV_REF="$INV_URL"                        # used as the Referer header
 ```
@@ -62,7 +78,7 @@ The token is read at runtime — **never hardcode it** in the skill files or com
 | Endpoint | Body field | Notes |
 |---|---|---|
 | `POST /api/build/{id}/allocate/` | `items[]` | Each: `build_line`, `stock_item`, `quantity`. Parts MUST match. |
-| `POST /api/build/{id}/consume/` | `lines[]` | Each: `build_line`, `quantity`. **NOT `items`**. |
+| `POST /api/build/{id}/consume/` | `lines[]` | **NOT idempotent in 1.2.7.** Each: `build_line`, `quantity`. Re-submitting creates duplicate child stock items and doubles `build_line.consumed`. **Always filter to unconsumed lines first (step 6) and verify after (step 13).** |
 | `PATCH /api/stock/{id}/` (after output creation) | `is_building=true` | **Required** before `/complete/`. `is_building` is writable, NOT auto-set on creation, but `/complete/` requires it. |
 | `POST /api/build/{id}/complete/` | `outputs[]`, `location`, `status_custom_key` | **Required** to bump `build.completed`. Each output: `{"output": <stock_item_pk>, "quantity": <n>}`. Top-level `location` is required. Requires build in status 20 or 30. Output StockItem must have `is_building=true`. Sets the output StockItem to `status_custom_key` (default 10=OK) and clears `is_building`. |
 | `POST /api/build/{id}/finish/` | flags | `accept_overallocated`, `accept_unallocated`, `accept_incomplete`. Transitions 20→40. **Does NOT update `completed`** — that's `/complete/`'s job. |
@@ -72,6 +88,7 @@ The token is read at runtime — **never hardcode it** in the skill files or com
 | `GET /api/build/line/?build={id}` | n/a | Different from `/api/bom/`. |
 | `POST /api/build/` | part, quantity, target_date | `creation_date`, `start_date`, `status` are server-controlled. |
 | `PATCH /api/build/{id}/` | start/target/completion_date | `creation_date` and `completed` are read-only. |
+| `PATCH /api/build/line/{id}/` | `consumed` | Writable — useful for repairing the doubling bug after the fact, since `/api/build/{id}/` doesn't allow editing `completed` and the build_line PATCH is the only path back to consistency. |
 
 ## StockItem status enum (for output state)
 
@@ -113,9 +130,9 @@ The user printed Part 41 (`PLATE-CLEANER`) on 2026-04-24. The executed workflow:
 Build 18 (BO-0016) — Part 41, qty=1
 ├── /issue/              → status 20 (Production)
 ├── /allocate/           → build_line 29 (36g ← stock 26), build_line 30 (7g ← stock 32)
+├── /consume/            → build_line 29 consumed=36, build_line 30 consumed=7
 ├── Create StockItem 66  → part 41, build 18, status 50 (Attention)
 ├── PATCH StockItem 66   → is_building=true (required before /complete/)
-├── /consume/            → build_line 29 consumed=36, build_line 30 consumed=7
 ├── /complete/           → outputs: [{output: 66, quantity: 1}], status_custom_key: 10
 │                          → StockItem 66 status 50→10, is_building→false, build.completed: 0→1
 ├── /finish/             → status 40 (DONE)
