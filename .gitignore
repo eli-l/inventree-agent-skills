@@ -27,3 +27,9 @@ Thumbs.db
 *.key
 *.env
 .secrets/
+
+# Skill output directories — any subdirectory named `export/` is
+# treated as build output, not source. Matches at any depth so it
+# works for every skill in this repo.
+**/export/
+**/export/*

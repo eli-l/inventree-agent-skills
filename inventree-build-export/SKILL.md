@@ -127,11 +127,15 @@ Read-only. Required endpoints:
 inventree-build-export/
 ├── SKILL.md                 # this file
 ├── README.md
-├── .gitignore               # ignores /export/
 ├── scripts/
 │   └── export_builds.py     # the only executable
-└── export/                  # gitignored — output lands here
+└── export/                  # output lands here (gitignored at the repo root)
 ```
+
+The repo-root `.gitignore` matches `**/export/` and `**/export/*`, so
+this skill's `export/` folder is never committed — and the same pattern
+will work for any future skill that drops files into an `export/`
+directory.
 
 ## Requirements
 
